@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BlueBillywig.Sapi/BlueBillywig.Sapi.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BlueBillywig.Sapi.Tests/BlueBillywig.Sapi.Tests.csproj" />
+  </Folder>
+</Solution>
