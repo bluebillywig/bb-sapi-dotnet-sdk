@@ -2,6 +2,10 @@
 //
 //   SAPI_AUTH_KEY=<tokenId>-<secret> SAPI_BASE_URL=https://testsuite.acc.bbvms.com dotnet run
 //
+// Set SMOKE_UPLOAD_FILE=/path/to/video.mp4 to upload a real media file instead of the bundled
+// 179-byte PNG: a file larger than one part exercises the multi-part path, progress polling and
+// the wait for SAPI to finish processing the clip.
+//
 // SAPI_AUTH_KEY follows the bb-sapi CLI convention; SAPI_BASE_URL defaults to the publication's
 // production host, so ALWAYS set it when targeting ACC.
 using System.Text.Json;
@@ -18,7 +22,7 @@ var baseUrl = Environment.GetEnvironmentVariable("SAPI_BASE_URL");
 var dash = key.IndexOf('-');
 var tokenId = int.Parse(key[..dash]);
 var secret = key[(dash + 1)..];
-var pngPath = Path.Combine(AppContext.BaseDirectory, "smoke.png");
+var uploadPath = Environment.GetEnvironmentVariable("SMOKE_UPLOAD_FILE") ?? Path.Combine(AppContext.BaseDirectory, "smoke.png");
 
 using var sdk = new Sdk(publication, new RpcTokenAuthenticator(tokenId, secret), new SdkOptions { BaseUri = baseUrl });
 Console.WriteLine($"BaseUri {sdk.BaseUri}, token id {tokenId}");
@@ -85,22 +89,41 @@ try
     var updated = Obj(await sdk.MediaClip.UpdateAsync(createdId.Value, new MediaClipProps { Description = "updated by bb-sapi-dotnet-sdk smoke run" }));
     Console.WriteLine($"description={updated["description"]}");
 
-    Step("initialize + execute upload (smoke.png)");
-    var init = await sdk.MediaClip.InitializeUploadAsync(pngPath, createdId);
+    Step($"initialize + execute upload ({Path.GetFileName(uploadPath)}, {new FileInfo(uploadPath).Length} bytes)");
+    var init = await sdk.MediaClip.InitializeUploadAsync(uploadPath, createdId);
     Console.WriteLine($"init status={init.StatusCode} body={init.Body[..Math.Min(300, init.Body.Length)]}");
     init.AssertOk();
     var upload = init.Json<UploadData>()!;
-    Console.WriteLine($"chunks={upload.Chunks} urls={upload.PresignedUrls?.Count} key={upload.Key} uploadId={upload.UploadId} listPartsUrl={(upload.ListPartsUrl is null ? "null" : "set")}");
-    var ok = await sdk.MediaClip.ExecuteUploadAsync(pngPath, upload);
-    Console.WriteLine($"executeUpload -> {ok}");
+    Console.WriteLine($"chunks={upload.Chunks} urls={upload.PresignedUrls?.Count} chunkSize={upload.PresignedUrls?[0].ChunkSize} key={upload.Key} uploadId={(string.IsNullOrEmpty(upload.UploadId) ? "(none)" : "set")} listPartsUrl={(upload.ListPartsUrl is null ? "null" : "set")}");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var ok = await sdk.MediaClip.ExecuteUploadAsync(uploadPath, upload);
+    Console.WriteLine($"executeUpload -> {ok} in {sw.Elapsed.TotalSeconds:F1}s");
     if (upload.ListPartsUrl is not null && upload.HeadObjectUrl is not null)
     {
         await foreach (var p in sdk.MediaClip.UploadProgressAsync(upload.ListPartsUrl, upload.HeadObjectUrl, upload.Chunks!.Value, 500, 20))
             Console.WriteLine($"progress {p}%");
     }
-    await Task.Delay(3000);
-    var after = Obj(await sdk.MediaClip.GetAsync(createdId.Value));
-    Console.WriteLine($"after upload: src={after["src"]} originalfilename={after["originalfilename"]} mediatype={after["mediatype"]}");
+
+    Step("wait for SAPI to process the clip (up to 3 minutes)");
+    var deadline = DateTime.UtcNow.AddMinutes(3);
+    JsonObject after;
+    do
+    {
+        await Task.Delay(5000);
+        after = Obj(await sdk.MediaClip.GetAsync(createdId.Value));
+        var jobs = after["jobs"] as JsonArray;
+        var jobSummary = jobs is null ? "n/a" : string.Join(",", jobs.Select(j => $"{j?["type"]}:{j?["status"]}"));
+        Console.WriteLine($"  src={after["src"]} originalfilename={after["originalfilename"]} length={after["length"]} status={after["status"]} jobs=[{jobSummary}]");
+        if (!string.IsNullOrEmpty(after["src"]?.ToString()) && !string.IsNullOrEmpty(after["length"]?.ToString())) break;
+    } while (DateTime.UtcNow < deadline);
+    if (string.IsNullOrEmpty(after["src"]?.ToString())) { Console.WriteLine("clip not processed within the wait window"); failures++; }
+    else
+    {
+        Console.WriteLine($"source path: {await sdk.MediaClip.GetSourcePathAsync(createdId.Value)}");
+        using var http2 = new HttpClient();
+        var posterResp = await http2.GetAsync(sdk.Thumbnail.GetMediaClipPosterPath(createdId.Value, 320, 180, new RpcTokenAuthenticator(tokenId, secret).Authenticate()["rpctoken"]));
+        Console.WriteLine($"poster of new clip -> {(int)posterResp.StatusCode} {posterResp.Content.Headers.ContentType}");
+    }
 }
 catch (Exception e)
 {
