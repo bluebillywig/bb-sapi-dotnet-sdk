@@ -65,9 +65,10 @@ All entities support standard CRUD operations where applicable. IDs are accepted
 | `sdk.Channel` | Yes | Yes | Yes | Yes | Yes | - |
 | `sdk.Playout` | Yes | Yes | Yes | Yes | Yes | - |
 | `sdk.Subtitle` | Yes | Yes | Yes | Yes | Yes | - |
-| `sdk.Thumbnail` | - | - | - | - | - | - |
 
-`sdk.MediaClipList` is the legacy alias for `sdk.Playlist`.
+`sdk.MediaClipList` is the legacy alias for `sdk.Playlist`. `sdk.Thumbnail` is not a CRUD
+entity: SAPI has no thumbnail records, only image routes, so it provides URL helpers (see
+[Thumbnails](#thumbnails)).
 
 ### Media Clips
 

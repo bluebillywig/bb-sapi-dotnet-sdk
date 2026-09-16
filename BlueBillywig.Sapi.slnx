@@ -5,4 +5,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/BlueBillywig.Sapi.Tests/BlueBillywig.Sapi.Tests.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/AccSmoke/AccSmoke.csproj" />
+  </Folder>
 </Solution>
