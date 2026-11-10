@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
+using System.Xml;
+using System.Xml.Linq;
 using BlueBillywig.Sapi.Contracts;
 using BlueBillywig.Sapi.Search;
 using BlueBillywig.Sapi.Types;
@@ -245,16 +247,23 @@ public sealed class MediaClip : Entity, IListable, IGettable, ICreatable<MediaCl
             throw new ArgumentException("uploadData for multi-part uploads must contain 'key' and 'uploadId' keys.", nameof(uploadData));
         }
 
-        var responses = await Task.WhenAll(uploadData.PresignedUrls.Select(url => PerformUploadAsync(mediaClipPath, url, cancellationToken))).ConfigureAwait(false);
+        SapiResponse[] responses;
         try
         {
+            // Every part is attempted (Task.WhenAll waits for all of them, even when one throws),
+            // then the responses are asserted, and only then is a failed upload aborted.
+            var uploads = uploadData.PresignedUrls.Select(url => PerformUploadAsync(mediaClipPath, url, cancellationToken)).ToList();
+            responses = await Task.WhenAll(uploads).ConfigureAwait(false);
             SapiResponse.AssertAllOk(responses);
         }
         catch
         {
+            // ANY failure (non-2xx part, transport error, IO error, cancellation) aborts the
+            // multi-part upload so S3 does not keep billing for orphaned parts. CancellationToken.None
+            // so a cancelled caller still aborts; abort failures are swallowed to preserve the original error.
             try
             {
-                var abortResponse = await AbortUploadAsync(uploadData.Key!, uploadData.UploadId!, cancellationToken).ConfigureAwait(false);
+                var abortResponse = await AbortUploadAsync(uploadData.Key!, uploadData.UploadId!, CancellationToken.None).ConfigureAwait(false);
                 abortResponse.AssertOk();
             }
             catch
@@ -273,31 +282,120 @@ public sealed class MediaClip : Entity, IListable, IGettable, ICreatable<MediaCl
         return true;
     }
 
+    /// <summary>S3 caps a single part (and a single PUT object) at 5 GiB.</summary>
+    internal const long MaxPartSize = 5L * 1024 * 1024 * 1024;
+
+    /// <summary>Length in bytes of the slice a presigned URL covers: computed in <c>long</c>, clamped to the file.</summary>
+    internal static long ComputePartLength(long fileLength, long? chunkSize, long? offset)
+    {
+        var start = offset ?? 0;
+        var size = chunkSize ?? fileLength;
+        return Math.Max(0, Math.Min(size, fileLength - start));
+    }
+
     private async Task<SapiResponse> PerformUploadAsync(string mediaClipPath, PresignedUrl presignedUrl, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var fileLength = new FileInfo(mediaClipPath).Length;
-        var chunkSize = presignedUrl.ChunkSize ?? fileLength;
         var offset = presignedUrl.Offset ?? 0;
-
-        // Read the chunk into a buffer so the PUT carries a Content-Length and no chunked
-        // Transfer-Encoding, which the S3 presigned PUT rejects (501 NotImplemented). Only one
-        // bounded chunk is held in memory per part.
-        var length = (int)Math.Max(0, Math.Min(chunkSize, fileLength - offset));
-        var buffer = new byte[length];
-        using (var stream = new FileStream(mediaClipPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+        var length = ComputePartLength(fileLength, presignedUrl.ChunkSize, offset);
+        if (length > MaxPartSize)
         {
-            stream.Seek(offset, SeekOrigin.Begin);
-            await stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
+            throw new ArgumentException($"Upload part of {length} bytes exceeds the S3 maximum part size of {MaxPartSize} bytes.", nameof(presignedUrl));
         }
+
+        // Stream the slice instead of buffering it. ContentLength is set explicitly so HttpClient
+        // sends Content-Length and not chunked Transfer-Encoding, which the S3 presigned PUT rejects
+        // (501 NotImplemented). The stream is owned (and disposed) by the content.
+        var slice = new FileSliceStream(mediaClipPath, offset, length);
+        var content = new StreamContent(slice, 81920);
+        content.Headers.ContentLength = length;
 
         // Timeout zero: an upload's duration scales with file size, so the default request timeout
         // would abort large uploads. The presigned URL is cross-origin, so SendRequestAsync already
         // omits the rpctoken (no auth leak to S3).
         return await Sdk.SendRequestAsync("PUT", presignedUrl.PresignedUrlValue, new RequestOptions
         {
-            Body = new ByteArrayContent(buffer),
+            Body = content,
             Timeout = TimeSpan.Zero,
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Read-only, bounded view of <c>length</c> bytes of a file starting at <c>offset</c>.</summary>
+    private sealed class FileSliceStream : Stream
+    {
+        private readonly FileStream _file;
+        private readonly long _start;
+        private readonly long _length;
+        private long _position;
+
+        public FileSliceStream(string path, long offset, long length)
+        {
+            _file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+            _start = offset;
+            _length = length;
+            try { _file.Seek(offset, SeekOrigin.Begin); }
+            catch { _file.Dispose(); throw; }
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => _length;
+        public override long Position
+        {
+            get => _position;
+            set => Seek(value, SeekOrigin.Begin);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            var remaining = _length - _position;
+            if (remaining <= 0) return 0;
+            if (buffer.Length > remaining) buffer = buffer[..(int)remaining];
+            var read = _file.Read(buffer);
+            _position += read;
+            return read;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var remaining = _length - _position;
+            if (remaining <= 0) return 0;
+            if (buffer.Length > remaining) buffer = buffer[..(int)remaining];
+            var read = await _file.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            _position += read;
+            return read;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            var target = origin switch
+            {
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => _position + offset,
+                _ => _length + offset,
+            };
+            if (target < 0) throw new IOException("Attempted to seek before the start of the stream.");
+            _position = Math.Min(target, _length);
+            _file.Seek(_start + _position, SeekOrigin.Begin);
+            return _position;
+        }
+
+        public override void Flush() { }
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _file.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
     /// <summary>Polls S3 to determine upload progress as a percentage (0-100).</summary>
@@ -306,8 +404,10 @@ public sealed class MediaClip : Entity, IListable, IGettable, ICreatable<MediaCl
     /// <param name="partsCount">Total number of expected parts.</param>
     /// <param name="requestDelay">Delay in ms before making the request.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
+    /// <exception cref="ArgumentOutOfRangeException">when <paramref name="partsCount"/> is zero or negative.</exception>
     public async Task<double> GetUploadProgressAsync(string listPartsUrl, string headObjectUrl, int partsCount, int requestDelay = 0, CancellationToken cancellationToken = default)
     {
+        RequirePositivePartsCount(partsCount);
         if (requestDelay > 0)
         {
             await Task.Delay(requestDelay, cancellationToken).ConfigureAwait(false);
@@ -323,19 +423,50 @@ public sealed class MediaClip : Entity, IListable, IGettable, ICreatable<MediaCl
 
         if (response.StatusCode == 200)
         {
-            var parts = (response.Json() as JsonObject)?["Part"];
-            var uploadedPartsCount = parts switch
-            {
-                JsonArray array => array.Count,
-                // S3 returns a single object instead of a 1-element array for one part
-                JsonObject => 1,
-                _ => 0,
-            };
-            return (double)uploadedPartsCount / partsCount * 100;
+            var uploadedPartsCount = CountListedParts(response);
+            return Math.Clamp((double)uploadedPartsCount / partsCount * 100, 0, 100);
         }
 
         response.AssertOk();
         return 0; // unreachable, AssertOk throws
+    }
+
+    private static void RequirePositivePartsCount(int partsCount)
+    {
+        if (partsCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(partsCount), partsCount, "partsCount must be greater than zero.");
+        }
+    }
+
+    /// <summary>
+    /// Counts the uploaded parts in a ListParts body. The presigned S3 ListParts URL returns XML
+    /// (<c>ListPartsResult</c> with <c>Part</c> children, namespace ignored); a JSON body (legacy
+    /// proxy shape) is still accepted.
+    /// </summary>
+    private static int CountListedParts(SapiResponse response)
+    {
+        var body = response.Body.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
+        if (body.Length == 0) return 0;
+
+        var contentType = response.Header("Content-Type") ?? string.Empty;
+        if (contentType.Contains("json", StringComparison.OrdinalIgnoreCase) || body.StartsWith('{'))
+        {
+            var parts = (response.Json() as JsonObject)?["Part"];
+            return parts switch
+            {
+                JsonArray array => array.Count,
+                // A single object instead of a 1-element array for one part
+                JsonObject => 1,
+                _ => 0,
+            };
+        }
+
+        var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null };
+        using var stringReader = new StringReader(body);
+        using var xmlReader = XmlReader.Create(stringReader, settings);
+        var root = XDocument.Load(xmlReader).Root;
+        return root?.Elements().Count(e => e.Name.LocalName == "Part") ?? 0;
     }
 
     /// <summary>Yields upload progress percentages until complete.</summary>
@@ -345,20 +476,35 @@ public sealed class MediaClip : Entity, IListable, IGettable, ICreatable<MediaCl
     /// <param name="pollInterval">Minimum interval (ms) between polls.</param>
     /// <param name="maxIterations">Maximum number of polls (0 = unlimited).</param>
     /// <param name="cancellationToken">A cancellation token.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// when <paramref name="partsCount"/> is zero or negative; thrown eagerly, at the call, not on first MoveNext.
+    /// </exception>
     /// <exception cref="InvalidOperationException">when <paramref name="maxIterations"/> is exceeded.</exception>
-    public async IAsyncEnumerable<double> UploadProgressAsync(
+    public IAsyncEnumerable<double> UploadProgressAsync(
         string listPartsUrl,
         string headObjectUrl,
         int partsCount,
         int pollInterval = DefaultUploadProgressPollInterval,
         int maxIterations = 0,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
+    {
+        RequirePositivePartsCount(partsCount);
+        return PollUploadProgressAsync(listPartsUrl, headObjectUrl, partsCount, pollInterval, maxIterations, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<double> PollUploadProgressAsync(
+        string listPartsUrl,
+        string headObjectUrl,
+        int partsCount,
+        int pollInterval,
+        int maxIterations,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         double uploadProgress = 0;
         long timePrevStart = 0;
         var iterations = 0;
 
-        while (uploadProgress != 100)
+        while (uploadProgress < 100)
         {
             if (maxIterations > 0 && iterations >= maxIterations)
             {
