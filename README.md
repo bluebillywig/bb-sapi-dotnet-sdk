@@ -140,8 +140,18 @@ var response = await sdk.Playlist.DeleteAsync(1);
 ## File Uploads
 
 The SDK supports single-chunk and multi-part uploads to S3 via presigned URLs. Each part is
-sent as a sized body (`Content-Length`, no chunked transfer encoding), one part in memory at a
-time.
+streamed from the file as a sized body (`Content-Length` set explicitly, no chunked transfer
+encoding, which S3 presigned PUTs reject); parts are never buffered in memory. Part sizes are
+computed in 64-bit and may be up to the S3 maximum of 5 GiB.
+
+If any part of a multi-part upload fails (non-2xx response, network or IO error, cancellation),
+all parts are still attempted, then the upload is aborted (`AbortUploadAsync`, also when the
+caller's token was cancelled) and the original exception is rethrown. A failed abort is swallowed.
+
+Progress is read from the presigned S3 ListParts URL, which returns XML; the SDK counts the
+`Part` elements (a JSON body is still accepted). `partsCount` must be greater than zero
+(`ArgumentOutOfRangeException` otherwise, thrown at the call for `UploadProgressAsync`); progress
+is clamped to 0-100 and the stream ends at 100.
 
 ```csharp
 // 1. Initialize the upload
@@ -255,6 +265,11 @@ var sdk = Sdk.WithRpcTokenAuthentication("my-publication", tokenId, sharedSecret
     Timeout = TimeSpan.FromSeconds(30),
 });
 ```
+
+Redirects: the SDK-owned `HttpClient` does not follow redirects (a 3xx comes back as a non-OK
+response), because `HttpClient` would re-send the `rpctoken` header to the redirect target. If you
+inject your own `HttpClient`, the SDK cannot inspect its handler: you must disable auto-redirect
+yourself, e.g. `new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false })`.
 
 Authentication headers are attached only to same-origin (SAPI) requests; cross-origin URLs
 such as presigned S3 upload and progress URLs never receive the RPC token.

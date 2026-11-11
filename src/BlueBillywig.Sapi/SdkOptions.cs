@@ -11,6 +11,13 @@ public sealed class SdkOptions
     /// When omitted the SDK creates and owns one. The SDK manages request timeouts itself, so a
     /// supplied client's own <see cref="System.Net.Http.HttpClient.Timeout"/> should be infinite
     /// or larger than <see cref="Timeout"/>.
+    /// <para>
+    /// <b>Redirects:</b> the SDK-owned client does not follow redirects. The SDK cannot inspect the
+    /// handler of an injected client, so that client MUST be built with auto-redirect disabled
+    /// (for example <c>new SocketsHttpHandler { AllowAutoRedirect = false }</c>); otherwise
+    /// <see cref="System.Net.Http.HttpClient"/> re-sends custom headers such as the <c>rpctoken</c>
+    /// to the redirect target, which can be another origin.
+    /// </para>
     /// </summary>
     public HttpClient? HttpClient { get; set; }
 

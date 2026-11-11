@@ -55,7 +55,9 @@ public sealed class Sdk : IDisposable
         _timeout = options.Timeout;
         if (options.HttpClient is null)
         {
-            _http = new HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
+            // Never follow redirects: HttpClient re-sends custom headers (the rpctoken) to the redirect
+            // target, which may be another origin. A 3xx surfaces as a non-OK SapiResponse instead.
+            _http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
             _ownsHttpClient = true;
         }
         else

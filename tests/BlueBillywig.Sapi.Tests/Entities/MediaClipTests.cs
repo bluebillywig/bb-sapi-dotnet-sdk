@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using BlueBillywig.Sapi.Entities;
 using BlueBillywig.Sapi.Exceptions;
 using BlueBillywig.Sapi.Tests.Helpers;
 using BlueBillywig.Sapi.Types;
@@ -466,6 +467,185 @@ public class MediaClipTests
             await foreach (var _ in sdk.MediaClip.UploadProgressAsync(ListParts, HeadObject, 5, 10, 2)) { }
         });
         Assert.Equal("Upload progress polling exceeded the maximum of 2 iterations.", ex.Message);
+    }
+
+    // ---- upload hardening -------------------------------------------------------------------
+
+    private sealed class ThrowingHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _send;
+        public List<string> Urls { get; } = new();
+        public ThrowingHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) => _send = send;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            lock (Urls) Urls.Add(request.RequestUri!.AbsoluteUri);
+            return _send(request);
+        }
+    }
+
+    [Fact]
+    public async Task AbortsUploadWhenAPartThrowsATransportError()
+    {
+        var handler = new ThrowingHandler(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/2")) throw new HttpRequestException("connection reset");
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        });
+        var sdk = new Sdk("my-publication", new BlueBillywig.Sapi.Authentication.EmptyAuthenticator(), new SdkOptions { HttpClient = new HttpClient(handler) });
+        var (path, cleanup) = TempFile(30, 0x43);
+        try
+        {
+            await Assert.ThrowsAsync<SapiConnectionException>(() => sdk.MediaClip.ExecuteUploadAsync(path, ThreePartUpload()));
+            Assert.Equal(4, handler.Urls.Count);
+            Assert.Contains(handler.Urls, u => PathOf(u) == "/sapi/mediaclip/0/abortUpload");
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public async Task AbortsUploadWhenCancelledEvenWithCancelledToken()
+    {
+        using var cts = new CancellationTokenSource();
+        var handler = new ThrowingHandler(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/abortUpload")) return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+        var sdk = new Sdk("my-publication", new BlueBillywig.Sapi.Authentication.EmptyAuthenticator(), new SdkOptions { HttpClient = new HttpClient(handler) });
+        var (path, cleanup) = TempFile(30, 0x43);
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sdk.MediaClip.ExecuteUploadAsync(path, ThreePartUpload(), cts.Token));
+            Assert.Contains(handler.Urls, u => PathOf(u) == "/sapi/mediaclip/0/abortUpload");
+        }
+        finally { cleanup(); }
+    }
+
+    private static string S3List(int parts)
+    {
+        var sb = new System.Text.StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>b</Bucket><Key>k</Key><UploadId>u</UploadId><Owner><ID>x</ID></Owner><Initiator><ID>x</ID></Initiator><StorageClass>STANDARD</StorageClass><IsTruncated>false</IsTruncated>");
+        for (var i = 1; i <= parts; i++) sb.Append($"<Part><PartNumber>{i}</PartNumber><ETag>\"e{i}\"</ETag><Size>10</Size></Part>");
+        return sb.Append("</ListPartsResult>").ToString();
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 25)]
+    [InlineData(3, 75)]
+    public async Task ProgressParsesS3XmlListParts(int parts, double expected)
+    {
+        var (sdk, _) = Create(new MockResponse { Body = S3List(parts), Headers = new() { ["Content-Type"] = "application/xml" } });
+        Assert.Equal(expected, await sdk.MediaClip.GetUploadProgressAsync(ListParts, HeadObject, 4));
+    }
+
+    [Fact]
+    public async Task ProgressXmlWithoutContentTypeIsParsed()
+    {
+        var (sdk, _) = Create(Ok(S3List(2)));
+        Assert.Equal(50, await sdk.MediaClip.GetUploadProgressAsync(ListParts, HeadObject, 4));
+    }
+
+    [Fact]
+    public async Task ProgressXmlRejectsDtd()
+    {
+        var (sdk, _) = Create(Ok("<?xml version=\"1.0\"?><!DOCTYPE x [<!ENTITY e \"v\">]><ListPartsResult><Part/></ListPartsResult>"));
+        await Assert.ThrowsAnyAsync<System.Xml.XmlException>(() => sdk.MediaClip.GetUploadProgressAsync(ListParts, HeadObject, 4));
+    }
+
+    [Fact]
+    public async Task ProgressJsonContentTypeStillWorks()
+    {
+        var (sdk, _) = Create(new MockResponse { Body = "{\"Part\":[{},{}]}", Headers = new() { ["Content-Type"] = "application/json" } });
+        Assert.Equal(40, await sdk.MediaClip.GetUploadProgressAsync(ListParts, HeadObject, 5));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task ProgressThrowsForNonPositivePartsCount(int partsCount)
+    {
+        var (sdk, h) = Create();
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => sdk.MediaClip.GetUploadProgressAsync(ListParts, HeadObject, partsCount));
+        Assert.Empty(h.Calls);
+    }
+
+    [Fact]
+    public void ProgressStreamThrowsEagerlyForNonPositivePartsCount()
+    {
+        var (sdk, h) = Create();
+        // Thrown at the call itself, without enumerating.
+        Assert.Throws<ArgumentOutOfRangeException>(() => sdk.MediaClip.UploadProgressAsync(ListParts, HeadObject, 0));
+        Assert.Empty(h.Calls);
+    }
+
+    [Fact]
+    public async Task ProgressStreamStopsWhenPartCountOvershoots()
+    {
+        var (sdk, _) = Create(Ok("{\"Part\":[{},{},{},{}]}"));
+        var progress = new List<double>();
+        await foreach (var p in sdk.MediaClip.UploadProgressAsync(ListParts, HeadObject, 3, 10)) progress.Add(p);
+        Assert.Equal(new double[] { 100 }, progress);
+    }
+
+    [Fact]
+    public async Task UploadPartIsSizedAndStreamedExactlyTheSlice()
+    {
+        var (sdk, h) = Create(Ok(), Ok(), Ok(), Ok());
+        var path = Path.Combine(Path.GetTempPath(), $"bb-sdk-test-{Guid.NewGuid():N}.bin");
+        File.WriteAllBytes(path, Enumerable.Range(0, 30).Select(i => (byte)i).ToArray());
+        try
+        {
+            await sdk.MediaClip.ExecuteUploadAsync(path, ThreePartUpload());
+            var byUrl = h.Calls.Take(3).OrderBy(c => c.Url).ToList();
+            for (var i = 0; i < 3; i++)
+            {
+                Assert.Equal("10", byUrl[i].Header("Content-Length"));
+                Assert.Null(byUrl[i].Header("Transfer-Encoding"));
+                Assert.Equal(Enumerable.Range(i * 10, 10).Select(x => (byte)x).ToArray(), byUrl[i].Body);
+            }
+        }
+        finally { try { File.Delete(path); } catch { } }
+    }
+
+    [Fact]
+    public void ComputePartLengthDoesNotOverflowAboveTwoGiB()
+    {
+        const long fourGiB = 4L * 1024 * 1024 * 1024;
+        Assert.Equal(fourGiB, MediaClip.ComputePartLength(fourGiB, null, null));
+        Assert.Equal(3L * 1024 * 1024 * 1024, MediaClip.ComputePartLength(fourGiB, 3L * 1024 * 1024 * 1024, 0));
+        Assert.Equal(1024, MediaClip.ComputePartLength(fourGiB, 5L * 1024 * 1024 * 1024, fourGiB - 1024));
+        Assert.Equal(0, MediaClip.ComputePartLength(100, 10, 200));
+    }
+
+    [Fact]
+    public async Task LargePartSendsLongContentLengthWithoutReadingTheBody()
+    {
+        const long size = 3L * 1024 * 1024 * 1024; // > int.MaxValue; sparse file, nothing is read
+        var path = Path.Combine(Path.GetTempPath(), $"bb-sdk-test-{Guid.NewGuid():N}.bin");
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Create)) fs.SetLength(size);
+            long? contentLength = null;
+            bool? chunked = null;
+            var handler = new ThrowingHandler(req =>
+            {
+                contentLength = req.Content!.Headers.ContentLength;
+                chunked = req.Headers.TransferEncodingChunked;
+                return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+            });
+            var sdk = new Sdk("my-publication", new BlueBillywig.Sapi.Authentication.EmptyAuthenticator(), new SdkOptions { HttpClient = new HttpClient(handler) });
+
+            await sdk.MediaClip.ExecuteUploadAsync(path, new UploadData
+            {
+                Chunks = 1,
+                PresignedUrls = new List<PresignedUrl> { new() { PresignedUrlValue = "https://s3.example.com/presigned-url" } },
+            });
+
+            Assert.Equal(size, contentLength);
+            Assert.NotEqual(true, chunked);
+        }
+        finally { try { File.Delete(path); } catch { } }
     }
 
     [Fact]
